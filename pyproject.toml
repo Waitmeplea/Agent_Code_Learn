@@ -1,0 +1,21 @@
+[project]
+name = "agent-code-learn"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Zzz", email = "905611180@qq.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "deepseek>=1.0.0",
+    "dotenv>=0.9.9",
+    "openai>=3.8.0",
+]
+
+[project.scripts]
+agent-code-learn = "agent_code_learn:main"
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.13.0"]
+build-backend = "uv_build"
