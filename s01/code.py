@@ -32,6 +32,10 @@ import os  # 用于处理环境变量
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
+from openai.types.chat import ChatCompletionMessageParam
+from dotenv import load_dotenv
+load_dotenv()
+
 
 # # windows系统无需修复这类问题且不存在内置的readline库，以下代码执行时会跳过
 # try:
@@ -111,7 +115,7 @@ def run_bash(command: str) -> str:
 
 # 模型客户端获取
 client = OpenAI(
-    api_key=os.environ.get('DEEPSEEK_API_KEY',),
+    api_key=os.environ.get('DEEPSEEK_API_KEY',os.getenv("DEEPSEEK_KEY")),
     base_url="https://api.deepseek.com")
 
 MODEL="deepseek-v4-flash"
@@ -122,8 +126,8 @@ messages=[{"role": "user", "content": "看下该文件夹下有什么"}]
 
 # -- 核心板块: 一个持续触发工具调用的循环，直至模型主动终止。 --
 response = client.chat.completions.create(
+    messages=[{"role": "system", "content": SYSTEM}] + messages,  # type: ignore
     model=MODEL,
-    messages=[{"role": "system", "content": SYSTEM}] + messages,
     tools=TOOLS,
     max_tokens=8000,
     extra_body={
@@ -131,11 +135,52 @@ response = client.chat.completions.create(
         "thinking": {"type": "disabled"}
     }
 )
-print(response.choices[0].message.content)
+print(response)
 
-# def agent_loop(messages: list):
-#     while True:
-#         response = client.messages.create(
-#             model=MODEL, system=SYSTEM, messages=messages,
-#             tools=TOOLS, max_tokens=8000,
-#         )
+# 附上anthropic和openai输出的主要对应关系：
+# 左侧围anthropic右侧为openai
+# response.content	response.choices[0].message
+# content 中的 tool_use	message.tool_calls
+# block.name	tool_call.function.name
+# block.input，字典	tool_call.function.arguments，JSON 字符串
+# block.id	tool_call.id
+# user 中的 tool_result	独立的 role: "tool" 消息
+# 请求参数 system=SYSTEM	messages 中的 system 消息
+
+def agent_loop(messages: list):
+    # 构建一个新的列表，确保类型对齐
+    while True:
+        response = client.chat.completions.create(
+            messages= [{"role": "system", "content": SYSTEM}]+messages,# type: ignore
+            model=MODEL,
+            tools=TOOLS,
+            max_tokens=8000,
+            extra_body={
+                "reasoning_effort": "high",
+                "thinking": {"type": "disabled"}
+            }
+        )
+        # 模型返回
+        assistant_message = response.choices[0].message
+        # 将本轮会话的ai输出加入对话上下文中
+        messages.append({"role": "assistant", "content": assistant_message})
+
+        # 如果没有工具调用，则循环结束返回
+        tool_calls = assistant_message.tool_calls or []
+        if not tool_calls:
+            return
+
+        # 如果存在工具调用，则依次执行工具获取结果
+        results = []
+        for block in tool_calls:
+            print(f"\033[33m$ {block.input['command']}\033[0m")
+            output = run_bash(block.input["command"])
+            print(output[:200])
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            })
+
+        # Feed tool results back, loop continues
+        messages.append({"role": "user", "content": results})
