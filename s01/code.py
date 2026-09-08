@@ -125,17 +125,17 @@ SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使
 messages=[{"role": "user", "content": "看下该文件夹下有什么"}]
 
 # -- 核心板块: 一个持续触发工具调用的循环，直至模型主动终止。 --
-response = client.chat.completions.create(
-    messages=[{"role": "system", "content": SYSTEM}] + messages,  # type: ignore
-    model=MODEL,
-    tools=TOOLS,
-    max_tokens=8000,
-    extra_body={
-        "reasoning_effort": "high",
-        "thinking": {"type": "disabled"}
-    }
-)
-print(response)
+# response = client.chat.completions.create(
+#     messages=[{"role": "system", "content": SYSTEM}] + messages,  # type: ignore
+#     model=MODEL,
+#     tools=TOOLS,
+#     max_tokens=8000,
+#     extra_body={
+#         "reasoning_effort": "high",
+#         "thinking": {"type": "disabled"}
+#     }
+# )
+# print(response)
 
 # 附上anthropic和openai输出的主要对应关系：
 # 左侧围anthropic右侧为openai
@@ -163,8 +163,12 @@ def agent_loop(messages: list):
         # 模型返回
         assistant_message = response.choices[0].message
         # 将本轮会话的ai输出加入对话上下文中
-        messages.append({"role": "assistant", "content": assistant_message})
-
+        messages.append(assistant_message)
+        # messages.append({"role": "assistant", "content": assistant_message})
+        print(assistant_message)
+        print('------------------')
+        print(messages)
+        return
         # 如果没有工具调用，则循环结束返回
         tool_calls = assistant_message.tool_calls or []
         if not tool_calls:
@@ -184,3 +188,5 @@ def agent_loop(messages: list):
 
         # Feed tool results back, loop continues
         messages.append({"role": "user", "content": results})
+
+agent_loop(messages)
