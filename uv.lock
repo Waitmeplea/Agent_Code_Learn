@@ -14,6 +14,7 @@ dependencies = [
     { name = "deepseek" },
     { name = "dotenv" },
     { name = "openai" },
+    { name = "python-dotenv" },
 ]
 
 [package.metadata]
@@ -21,6 +22,7 @@ requires-dist = [
     { name = "deepseek", specifier = ">=1.0.0" },
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "openai", specifier = ">=3.8.0" },
+    { name = "python-dotenv", specifier = ">=1.2.3" },
 ]
 
 [[package]]

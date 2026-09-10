@@ -34,6 +34,8 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
 from openai.types.chat import ChatCompletionMessageParam
 from dotenv import load_dotenv
+import json
+import subprocess
 load_dotenv()
 
 
@@ -119,34 +121,10 @@ client = OpenAI(
     base_url="https://api.deepseek.com")
 
 MODEL="deepseek-v4-flash"
-SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使用bash来完成这个任务，执行而不只是描述."
+SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使用windows的CMD来完成这个任务，执行而不只是描述,所有回复用中文回答."
 
-
-messages=[{"role": "user", "content": "看下该文件夹下有什么"}]
 
 # -- 核心板块: 一个持续触发工具调用的循环，直至模型主动终止。 --
-# response = client.chat.completions.create(
-#     messages=[{"role": "system", "content": SYSTEM}] + messages,  # type: ignore
-#     model=MODEL,
-#     tools=TOOLS,
-#     max_tokens=8000,
-#     extra_body={
-#         "reasoning_effort": "high",
-#         "thinking": {"type": "disabled"}
-#     }
-# )
-# print(response)
-
-# 附上anthropic和openai输出的主要对应关系：
-# 左侧围anthropic右侧为openai
-# response.content	response.choices[0].message
-# content 中的 tool_use	message.tool_calls
-# block.name	tool_call.function.name
-# block.input，字典	tool_call.function.arguments，JSON 字符串
-# block.id	tool_call.id
-# user 中的 tool_result	独立的 role: "tool" 消息
-# 请求参数 system=SYSTEM	messages 中的 system 消息
-
 def agent_loop(messages: list):
     # 构建一个新的列表，确保类型对齐
     while True:
@@ -162,31 +140,62 @@ def agent_loop(messages: list):
         )
         # 模型返回
         assistant_message = response.choices[0].message
-        # 将本轮会话的ai输出加入对话上下文中
+        # 将本轮会话的ai输出加入对话上下文中，模型会自动处理message格式，无需手动构造。
         messages.append(assistant_message)
         # messages.append({"role": "assistant", "content": assistant_message})
-        print(assistant_message)
-        print('------------------')
-        print(messages)
-        return
-        # 如果没有工具调用，则循环结束返回
+
+        # 检查tool_calls(列表),如果没有工具调用，则循环结束返回
         tool_calls = assistant_message.tool_calls or []
         if not tool_calls:
             return
 
-        # 如果存在工具调用，则依次执行工具获取结果
-        results = []
-        for block in tool_calls:
-            print(f"\033[33m$ {block.input['command']}\033[0m")
-            output = run_bash(block.input["command"])
-            print(output[:200])
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
+        # 存在工具调用，则依次执行工具获取结果
+        # 目前测试阶段只有一个工具bash 因此无需进行工具：名称映射。直接取参数传入工具就行了
+        for call in tool_calls:
+            try:
+
+                # 拿到参数字典
+                args = json.loads(call.function.arguments)
+                # 拿到实际的命令
+                command = args["command"]
+                print(f"\033[33m$ {command}\033[0m")
+
+                output = str(run_bash(command))
+                print(output[:200])
+
+            except Exception as exc:
+                # 将工具错误反馈给模型，让模型有机会调整
+                output = f"工具执行失败: {type(exc).__name__}: {exc}"
+            # 每次把tool的返回添加到message中
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call.id,
                 "content": output,
             })
 
-        # Feed tool results back, loop continues
-        messages.append({"role": "user", "content": results})
 
-agent_loop(messages)
+if __name__ == "__main__":
+    print("s01: Agent Loop (OpenAI Format)")
+    print("Enter a question, press Enter to send. Type q to quit.\n")
+
+    history = []
+    while True:
+        try:
+            # \001/\002 tell Readline the ANSI escapes have zero display width.
+            query = input("\001\033[36m\002s01 >> \001\033[0m\002")
+        except (EOFError, KeyboardInterrupt):
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            break
+
+        # OpenAI 格式：用户消息的 content 必须是字符串
+        history.append({"role": "user", "content": query})
+        agent_loop(history)
+        # OpenAI 格式：提取最后一条助手消息的文本内容
+        last_message = history[-1]
+        if last_message.role == "assistant":
+            final_text = getattr(last_message, "content", "")
+            if final_text:
+                print(final_text)
+
+        print()
