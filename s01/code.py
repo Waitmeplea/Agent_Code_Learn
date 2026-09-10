@@ -52,23 +52,6 @@ load_dotenv()
 
 
 
-# 由于我使用的是deepseek的key需要用openai 因此这部分注释掉
-# from anthropic import Anthropic
-# from dotenv import load_dotenv
-#
-# load_dotenv(override=True)
-#
-# if os.getenv("ANTHROPIC_BASE_URL"):
-#     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-#
-# client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-# MODEL = os.environ["MODEL_ID"]
-# Please install OpenAI SDK first: `pip3 install openai`
-
-
-
-
-
 
 # # -- bash工具定义（anthropic格式） --
 # TOOLS = [{
@@ -80,8 +63,6 @@ load_dotenv()
 #         "required": ["command"],
 #     },
 # }]
-
-
 
 # # -- bash工具定义（openai格式） --
 # 列表，用于告诉模型有什么工具可以使用
