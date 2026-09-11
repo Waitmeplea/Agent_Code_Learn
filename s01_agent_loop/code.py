@@ -28,7 +28,7 @@ AI 编程智能体的全部奥秘，都浓缩在以下这一个模式中：
     ANTHROPIC_API_KEY=你的API密钥 python s01_agent_loop/code.py
 """
 
-import os  # 用于处理环境变量
+import os
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
@@ -156,7 +156,7 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s01: Agent Loop (OpenAI Format)")
+    print("s01_agent_loop: Agent Loop (OpenAI Format)")
     print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
