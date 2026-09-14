@@ -1,25 +1,40 @@
-# s02_tool_use.py - 工具 (Tools)
+# s03_permission.py - 权限系统
 #
-# s01 中的智能体循环（agent loop）保持不变。本课新增了四个工具和一个调度映射表：
+# 在工具执行前，系统会插入三道“关卡”进行拦截：
 #
-#     +----------+      +-------+      +--------------------------+
+#     关卡 1：硬性拒绝名单（如 rm -rf /、sudo 等危险命令）
+#     关卡 2：规则匹配（例如：是否在沙箱工作区外写入？是否执行破坏性命令？）
+#     关卡 3：用户审批（暂停运行，等待用户确认）
 #
-#     |   用户   | ---> | 大模型 | ---> | 工具调度器               |
-#     |  提示词  |      |       |      | bash       -> run_bash   |
-#     +----------+      +---+---+      | read_file  -> run_read   |
-#                           ^          | write_file -> run_write  |
+#     +----------+      +-------+      +--------------+      +---------------+
 #
-#                           |          | edit_file  -> run_edit   |
-#                           +----------+ glob       -> run_glob   |
-#                           工具返回结果+--------------------------+
+#     |   用户   | ---> |  LLM  | ---> |   权限检查   | ---> |  工具调度执行 |
+#     |  提示词  |      |       |      | 1. 拒绝名单 |      |               |
+#     +----------+      +---+---+      | 2. 规则匹配 |      +-------+-------+
+#                           ^          | 3. 用户审批 |              |
 #
-#   + run_read / run_write / run_edit / run_glob
-#   + 使用 TOOL_HANDLERS（工具处理器）替代了原来硬编码的 run_bash 调用
-#   + safe_path（安全路径）确保文件工具的操作被限制在工作区内部
+#                           |          +------+-------+            |
+#                           |                 | 拒绝                |
+#                           |                 v                    v
+#                           |          +-------------------------------+
+#                           +----------+ 工具返回结果：被拒绝 或 正常输出 |
+#                                      +-------------------------------+
 #
-# 核心洞察：循环逻辑保持不变，增长的只是工具的注册与调度机制。
+# 在智能体（Agent）循环中，仅需添加一行代码即可生效：
+#
+#     if not check_permission(block):
+#         continue
+#
+# 本模块基于 s02（多工具支持）构建。运行方式：
+#
+#     python s03_permission/code.py
+#
+# 环境依赖：需安装 anthropic 和 python-dotenv，并在 .env 文件中配置 ANTHROPIC_API_KEY
+
 
 import os
+import re
+from typing import List
 
 from openai import OpenAI
 from openai.types.chat import ChatCompletionToolParam
@@ -34,9 +49,7 @@ WORKDIR=Path.cwd()
 print("="*20+f"当前工作空间为{WORKDIR}"+"="*20)
 
 
-
-## s01定义的工具
-# -- 工具1：执行bash --
+# -- s02: 工具执行脚本 --
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -51,7 +64,6 @@ def run_bash(command: str) -> str:
     except (FileNotFoundError, OSError) as e:
         return f"Error: {e}"
 
-## s02新增工具
 def safe_path(p: str) -> Path:
     """
     安全路径解析器，用于防止路径遍历攻击（Path Traversal）。
@@ -184,8 +196,7 @@ def run_glob(pattern: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
-# s02 新增工具描述，一共5个 --
+# -- s02 : 工具定义和映射关系 --
 TOOLS: list[ChatCompletionToolParam] = [
     {
         "type": "function",
@@ -250,11 +261,80 @@ TOOLS: list[ChatCompletionToolParam] = [
     },
 ]
 
-# s02 新增工具名称与函数映射
+
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
 }
+
+
+# -- s03新增: 三道权限拦截管线· --
+
+# Gate 1: 严格禁止，直接拒绝
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+
+def check_deny_list(command: str) -> str | None:
+    for pattern in DENY_LIST:
+        if pattern in command:
+            return f"Blocked: '{pattern}' is on the deny list"
+    return None
+
+
+# Gate 2: 规则匹配——基于命令内容的检查
+DESTRUCTIVE_COMMAND_WORD = re.compile(
+    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
+)
+
+
+def contains_destructive_command(command: str) -> bool:
+    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
+
+
+PERMISSION_RULES = [
+    {"tools": ["read_file", "write_file", "edit_file"],
+     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+     "message": "Writing outside workspace"},
+    {"tools": ["bash"],
+     "check": lambda args: contains_destructive_command(args.get("command", "")) or
+     any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+     "message": "Potentially destructive command"},
+]
+
+def check_rules(tool_name: str, args: dict):
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+
+# Gate 3:用户审批——在规则匹配后等待确认
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n\033[33m[permission] {reason}\033[0m")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+
+
+# Pipeline: 三道关卡串联
+
+
+
+def check_permission(call) -> bool:
+    tool_name = call.function.name
+    tool_args = json.loads(call.function.arguments)
+    #  关卡 1：硬性拒绝名单 (Hard deny list)
+    if tool_name == "bash":
+        reason = check_deny_list(tool_args.get("command", ""))
+        if reason:
+            print(f"\n\033[31m[blocked] {reason}\033[0m")
+            return False
+    #  关卡 2 & 3：规则匹配 + 用户审批 (Rule matching & User approval)
+    reason = check_rules(tool_name, tool_args)
+    if reason:
+        decision = ask_user(tool_name, tool_args, reason)
+        if decision == "deny":
+            return False
+    return True
 
 # 模型客户端获取
 client = OpenAI(
@@ -264,8 +344,7 @@ client = OpenAI(
 MODEL="deepseek-v4-flash"
 SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使用windows的CMD来完成这个任务，执行而不只是描述,所有回复用中文回答."
 
-
-# -- 核心板块: 一个持续触发工具调用的循环，直至模型主动终止。 --
+# -- Agent loop: 在s02基础上增加人工审批环节 --
 def agent_loop(messages: list):
     # 构建一个新的列表，确保类型对齐
     while True:
@@ -294,9 +373,16 @@ def agent_loop(messages: list):
         for call in tool_calls:
             try:
                 print(f"\033[33m$ {call.function.name}\033[0m")
+
+                if not check_permission(call):
+                    messages.append({"role": "tool","tool_call_id": call.id,
+                                    "content": "Permission denied."})
+                    continue
                 handler=TOOL_HANDLERS.get(call.function.name)
                 # 拿到参数字典
                 args = json.loads(call.function.arguments)
+                # 执行之前进行判别
+
                 output = handler(**args) if handler else f"Unknown: {call.function.name}"
                 print(str(output)[:200])
 
@@ -313,16 +399,14 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s02: Tool Use - 在s01基础上新增4个工具")
+    print("s03: Permission")
     print("输入问题，回车键发送，输入 q 退出.\n")
-    # 问题：帮我创建 hello.py
-    # 正确的结果应该是在当前文件夹下有个hello.py文件
 
     history = []
     while True:
         try:
             # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s01 >> \001\033[0m\002")
+            query = input("\001\033[36m\002s03 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

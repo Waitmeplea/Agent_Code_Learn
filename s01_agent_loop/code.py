@@ -156,8 +156,10 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s01_agent_loop: Agent Loop (OpenAI Format)")
-    print("Enter a question, press Enter to send. Type q to quit.\n")
+    print("s01_agent_loop: 整体循环 (OpenAI版本)")
+    print("输入问题，回车键发送，输入 q 退出.\n")
+    # 问题：帮我创建 hello.py
+    # 正确的结果应该是在当前文件夹下有个hello.py文件
 
     history = []
     while True:
