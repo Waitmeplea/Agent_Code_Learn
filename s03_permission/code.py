@@ -316,9 +316,6 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
 
 
 # Pipeline: 三道关卡串联
-
-
-
 def check_permission(call) -> bool:
     tool_name = call.function.name
     tool_args = json.loads(call.function.arguments)
