@@ -258,12 +258,15 @@ TOOL_HANDLERS = {
 }
 
 # -- s04: 钩子系统 (s03 审批逻辑使用钩子) --
-# 钩子的字典，用户提交提示词，工具调用前，工具调用后，停止
+# 钩子的字典，用户提交提示词，工具调用前，工具调用后，停
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
+# 注册钩子，将方法注册到对应的事件中
 def register_hook(event: str, callback):
+    # 这部分可以再健壮一点，HOOKS.get('',[])再append
     HOOKS[event].append(callback)
 
+# 触发钩子
 def trigger_hooks(event: str, *args):
     for callback in HOOKS[event]:
         result = callback(*args)
@@ -282,62 +285,92 @@ DESTRUCTIVE_COMMAND_WORD = re.compile(
 DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
 
 def contains_destructive_command(command: str) -> bool:
+    """
+    检测是否包含破坏性的命令
+    :param command:
+    :return:
+    """
     return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
 
+def permission_hook(call):
+    """工具调用前: s03 check_permission() 的逻辑移动到这里."""
 
+    tool_name = call.function.name
+    tool_args = json.loads(call.function.arguments)
 
-
-
-
-def contains_destructive_command(command: str) -> bool:
-    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
-
-
-PERMISSION_RULES = [
-    {"tools": ["read_file", "write_file", "edit_file"],
-     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-     "message": "Writing outside workspace"},
-    {"tools": ["bash"],
-     "check": lambda args: contains_destructive_command(args.get("command", "")) or
-     any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
-     "message": "Potentially destructive command"},
-]
-
-def check_rules(tool_name: str, args: dict):
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
+    if tool_name == "bash":
+        command = tool_args.get("command", "")
+        for pattern in DENY_LIST:
+            if pattern in command:
+                print(f"\n\033[31m[blocked] '{pattern}'\033[0m")
+                return "Permission denied by deny list"
+        if contains_destructive_command(command) or any(
+            kw in command for kw in DESTRUCTIVE
+        ):
+            print(f"\n\033[33m[permission] Potentially destructive command\033[0m")
+            print(f"   Tool: {tool_name}({tool_args})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    if tool_name in ("read_file", "write_file", "edit_file"):
+        path = tool_args.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            print(f"\n\033[33m[permission] Access outside workspace\033[0m")
+            print(f"   Tool: {tool_name}({tool_args})")
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
     return None
 
 
-# Gate 3:用户审批——在规则匹配后等待确认
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n\033[33m[permission] {reason}\033[0m")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+def log_hook(block):
+    """工具调用前: 记录每个工具的调用"""
+    # 从 block.input（字典）中获取前2个参数的值，转为字符串，并截取前60个字符，防止日志过长
+    args_preview = str(list(block.input.values())[:2])[:60]
+    # 在控制台打印灰色的日志，显示工具名称和参数预览
+    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    # 返回 None 表示不干预当前流程，继续执行工具
+    return None
+
+def large_output_hook(block, output):
+    """工具调用后: 大输出警告."""
+    # 检查工具执行后的输出内容（转为字符串后）长度是否超过了 100,000 个字符
+    if len(str(output)) > 100000:
+        # 如果超过，打印黄色的警告信息，提示哪个工具产生了多大的输出
+        print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
+    # 返回 None 表示不干预当前流程，继续执行后续逻辑
+    return None
+
+# 用户提示词提交钩子：在用户输入到达大语言模型（LLM）之前，记录该输入，当前只返回工作目录。
+def context_inject_hook(query: str):
+    # 当用户提交提示词时，打印灰色的日志，显示当前 Agent 正在操作的工作目录（WORKDIR）
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    # 返回 None 表示不修改用户的原始输入，继续发送给大模型
+    return None
+
+# stop钩子: 当循环退出时打印汇总信息
+def summary_hook(messages: list):
+    # 统计整个会话历史（messages）中，工具调用结果（tool_result）的总数
+    # 这是一个嵌套的生成器表达式：
+    # 1. 遍历 messages 中的每一条消息 m
+    # 2. 获取 m 的 content，如果是列表则遍历，否则返回空列表
+    # 3. 检查列表中的块 b 是否是字典，且 type 为 "tool_result"
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    # 打印灰色的总结信息，显示本次会话总共调用了多少次工具
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    # 返回 None 表示不干预停止流程
+    return None
+
+# 将上述函数注册到对应的生命周期事件上
+register_hook("UserPromptSubmit", context_inject_hook)  # 注册到“用户提交提示词”事件
+register_hook("PreToolUse", permission_hook)            # 注册到“工具调用前”事件（执行权限检查）
+register_hook("PreToolUse", log_hook)                   # 注册到“工具调用前”事件（执行日志记录）
+register_hook("PostToolUse", large_output_hook)         # 注册到“工具调用后”事件（检查大输出）
+register_hook("Stop", summary_hook)                     # 注册到“会话停止”事件（打印总结）
 
 
-# Pipeline: 三道关卡串联
-
-
-
-def check_permission(call) -> bool:
-    tool_name = call.function.name
-    tool_args = json.loads(call.function.arguments)
-    #  关卡 1：硬性拒绝名单 (Hard deny list)
-    if tool_name == "bash":
-        reason = check_deny_list(tool_args.get("command", ""))
-        if reason:
-            print(f"\n\033[31m[blocked] {reason}\033[0m")
-            return False
-    #  关卡 2 & 3：规则匹配 + 用户审批 (Rule matching & User approval)
-    reason = check_rules(tool_name, tool_args)
-    if reason:
-        decision = ask_user(tool_name, tool_args, reason)
-        if decision == "deny":
-            return False
-    return True
 
 # 模型客户端获取
 client = OpenAI(
@@ -348,6 +381,44 @@ MODEL="deepseek-v4-flash"
 SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使用windows的CMD来完成这个任务，执行而不只是描述,所有回复用中文回答."
 
 # -- Agent loop: 在s02基础上增加人工审批环节 --
+
+def agent_loop(messages: list):
+    while True:
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM, messages=messages,
+            tools=TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            return
+
+        results = []
+        for block in tool_calls:
+            # s04 change: hook replaces hard-coded check_permission()
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": str(blocked)})
+                continue
+
+            handler = TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+
+            trigger_hooks("PostToolUse", block, output)  # s04: post hook
+
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+
+        messages.append({"role": "user", "content": results})
+
+
 def agent_loop(messages: list):
     # 构建一个新的列表，确保类型对齐
     while True:
@@ -370,6 +441,11 @@ def agent_loop(messages: list):
         # 检查tool_calls(列表),如果没有工具调用，则循环结束返回
         tool_calls = assistant_message.tool_calls or []
         if not tool_calls:
+            # 当没有工具的时候说明这轮会话结束，循环停止，触发停止后的钩子
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
             return
 
         # 存在工具调用，则依次执行工具获取结果
