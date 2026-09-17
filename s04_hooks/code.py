@@ -262,11 +262,14 @@ TOOL_HANDLERS = {
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
 # 注册钩子，将方法注册到对应的事件中
+# 注意: 事件名必须是 HOOKS 中已存在的 key，否则这里会直接 KeyError。
 def register_hook(event: str, callback):
-    # 这部分可以再健壮一点，HOOKS.get('',[])再append
     HOOKS[event].append(callback)
 
-# 触发钩子
+# 触发钩子: 依次调用某事件下注册的所有回调。
+# 返回值语义: 只要某个回调返回了非 None 的值，就立即返回该值，并跳过后续回调。
+#   这使得触发方可以据此判断是否需要阻断/干预当前流程（例如 PreToolUse 返回内容表示拒绝工具调用）。
+#   若所有回调都返回 None，则返回 None，表示不干预。
 def trigger_hooks(event: str, *args):
     for callback in HOOKS[event]:
         result = callback(*args)
@@ -323,21 +326,26 @@ def permission_hook(call):
     return None
 
 
-def log_hook(block):
+def log_hook(call):
     """工具调用前: 记录每个工具的调用"""
-    # 从 block.input（字典）中获取前2个参数的值，转为字符串，并截取前60个字符，防止日志过长
-    args_preview = str(list(block.input.values())[:2])[:60]
+    # 取出工具名，并解析工具调用的参数
+    tool_name = call.function.name
+    tool_args = json.loads(call.function.arguments)
+    # 从参数字典中获取前2个参数的值，转为字符串，并截取前60个字符，防止日志过长
+    args_preview = str(list(tool_args.values())[:2])[:60]
     # 在控制台打印灰色的日志，显示工具名称和参数预览
-    print(f"\033[90m[HOOK] {block.name}({args_preview})\033[0m")
+    print(f"\033[90m[HOOK] {tool_name}({args_preview})\033[0m")
     # 返回 None 表示不干预当前流程，继续执行工具
     return None
 
-def large_output_hook(block, output):
+def large_output_hook(call, output):
     """工具调用后: 大输出警告."""
     # 检查工具执行后的输出内容（转为字符串后）长度是否超过了 100,000 个字符
+    tool_name = call.function.name
+    tool_args = json.loads(call.function.arguments)
     if len(str(output)) > 100000:
         # 如果超过，打印黄色的警告信息，提示哪个工具产生了多大的输出
-        print(f"\033[33m[HOOK] Large output from {block.name}: {len(str(output))} chars\033[0m")
+        print(f"\033[33m[HOOK] Large output from {tool_name}: {len(str(output))} chars\033[0m")
     # 返回 None 表示不干预当前流程，继续执行后续逻辑
     return None
 
@@ -350,14 +358,11 @@ def context_inject_hook(query: str):
 
 # stop钩子: 当循环退出时打印汇总信息
 def summary_hook(messages: list):
-    # 统计整个会话历史（messages）中，工具调用结果（tool_result）的总数
-    # 这是一个嵌套的生成器表达式：
-    # 1. 遍历 messages 中的每一条消息 m
-    # 2. 获取 m 的 content，如果是列表则遍历，否则返回空列表
-    # 3. 检查列表中的块 b 是否是字典，且 type 为 "tool_result"
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    # 统计整个会话历史（messages）中，工具执行结果消息的总数。
+    # 说明: messages 中既包含 SDK 的 ChatCompletionMessage 对象，也包含我们手工追加的
+    #       dict（如 {"role": "tool", ...}）。这里只对 dict 类型、且 role 为 "tool" 的消息计数，
+    #       也就是统计本次会话累计执行了多少次工具调用。
+    tool_count = sum(1 for m in messages if isinstance(m, dict) and m.get("role") == "tool")
     # 打印灰色的总结信息，显示本次会话总共调用了多少次工具
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     # 返回 None 表示不干预停止流程
@@ -380,47 +385,12 @@ client = OpenAI(
 MODEL="deepseek-v4-flash"
 SYSTEM = f"你是一个编码智能体，你的工作路径在{os.getcwd()}. 使用windows的CMD来完成这个任务，执行而不只是描述,所有回复用中文回答."
 
-# -- Agent loop: 在s02基础上增加人工审批环节 --
 
+# -- Agent 主循环：与 s03 版本结构相同，但移除了硬编码的检查逻辑 --
+# s03 版本的做法：if not check_permission(block): ... （直接调用硬编码的权限检查函数）
+# s04 版本的做法：if trigger_hooks("PreToolUse", block): ... （改为触发通用的钩子事件）
 def agent_loop(messages: list):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
-        if not tool_calls:
-            force = trigger_hooks("Stop", messages)
-            if force:
-                messages.append({"role": "user", "content": force})
-                continue
-            return
-
-        results = []
-        for block in tool_calls:
-            # s04 change: hook replaces hard-coded check_permission()
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
-
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
-
-            trigger_hooks("PostToolUse", block, output)  # s04: post hook
-
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-
-        messages.append({"role": "user", "content": results})
-
-
-def agent_loop(messages: list):
-    # 构建一个新的列表，确保类型对齐
+    # 进入循环: 每轮先请求模型；有工具调用就执行工具并把结果回填，没有则结束本轮。
     while True:
         response = client.chat.completions.create(
             messages= [{"role": "system", "content": SYSTEM}]+messages,# type: ignore
@@ -434,9 +404,8 @@ def agent_loop(messages: list):
         )
         # 模型返回
         assistant_message = response.choices[0].message
-        # 将本轮会话的ai输出加入对话上下文中，模型会自动处理message格式，无需手动构造。
+        # 将本轮会话的 ai 输出加入对话上下文中（直接追加 SDK 返回的 ChatCompletionMessage 对象）
         messages.append(assistant_message)
-        # messages.append({"role": "assistant", "content": assistant_message})
 
         # 检查tool_calls(列表),如果没有工具调用，则循环结束返回
         tool_calls = assistant_message.tool_calls or []
@@ -452,10 +421,14 @@ def agent_loop(messages: list):
         for call in tool_calls:
             try:
                 print(f"\033[33m$ {call.function.name}\033[0m")
+                # s04 修改: 用钩子替代硬编码的 check_permission()
 
-                if not check_permission(call):
+                check_call = trigger_hooks("PreToolUse", call)
+
+
+                if check_call:
                     messages.append({"role": "tool","tool_call_id": call.id,
-                                    "content": "Permission denied."})
+                                    "content": str(check_call)})
                     continue
                 handler=TOOL_HANDLERS.get(call.function.name)
                 # 拿到参数字典
@@ -463,7 +436,9 @@ def agent_loop(messages: list):
                 # 执行之前进行判别
 
                 output = handler(**args) if handler else f"Unknown: {call.function.name}"
-                print(str(output)[:200])
+
+                # s04新增：工具调用后的钩子，只有在输出文本超限时触发
+                trigger_hooks("PostToolUse", call, output)  # s04: post hook
 
 
             except Exception as exc:
@@ -478,20 +453,21 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s03: Permission")
+    print("s04: Hooks")
     print("输入问题，回车键发送，输入 q 退出.\n")
 
     history = []
     while True:
         try:
             # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s03 >> \001\033[0m\002")
+            query = input("\001\033[36m\002s04 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
 
         # OpenAI 格式：用户消息的 content 必须是字符串
+        trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
         # OpenAI 格式：提取最后一条助手消息的文本内容
