@@ -37,7 +37,7 @@ WORKDIR=Path.cwd()
 print("="*20+f"当前工作空间为{WORKDIR}"+"="*20)
 
 
-# -- s02: 工具执行脚本 --
+# -- s06: 基础工具--
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
@@ -185,108 +185,9 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 
-# --s05新增: 由模型更新的结构化状态 --
-class TodoManager:
-    def __init__(self):
-        # 这个列表将用于存储经过校验的、标准化的待办事项字典（字典包含 content 和 status）。
-        self.items: list[dict] = []
-
-    # 这个是全量更新 会把整个items替换掉
-    def update(self, todos: list | str) -> str:
-        # 让方法既能接收 Python 原生的 list 对象，也能接收 JSON 字符串或类似 Python 字面量的字符串。
-        if isinstance(todos, str):
-            try:
-                # 如果是字符串，则按json格式解析
-                todos = json.loads(todos)
-            except json.JSONDecodeError:
-                try:
-                    # 否则看看是不是python风格的变量
-                    todos = ast.literal_eval(todos)
-                except (SyntaxError, ValueError) as e:
-                    raise ValueError("todos must be a list or JSON array string") from e
-        # 解析出来之后不是列表则退出
-        # 类型检查：确保解析后的结果是一个列表（list）。
-        # 数量限制：为了防止数据过载，强制规定待办事项列表最多只能包含20项。
-        if not isinstance(todos, list):
-            raise ValueError("todos must be a list")
-        if len(todos) > 20:
-            raise ValueError("Max 20 todos allowed")
-
-        validated = []
-        in_progress_count = 0
-        # 对每一个待办事项对象（todo）执行严格的清洗：
-        for index, todo in enumerate(todos):
-            # 每一项必须是字典（dict）。
-            if not isinstance(todo, dict):
-                raise ValueError(f"todos[{index}] must be an object")
-            # 数据清洗：提取 content（内容）和 status（状态）。使用 .strip() 去除内容首尾空格，使用 .lower() 将状态转为小写，确保数据的一致性。
-            content = str(todo.get("content", "")).strip()
-            status = str(todo.get("status", "pending")).lower()
-            # 非空校验：内容不能是空字符串。
-
-
-            if not content:
-                raise ValueError(f"todos[{index}] requires content")
-            # 枚举校验：状态只能是 "pending"（待办）、"in_progress"（进行中）或 "completed"（已完成）三者之一。
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"todos[{index}] has invalid status '{status}'")
-            # 计数器：如果当前项状态是 "in_progress"，计数器 in_progress_count 加 1。
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"content": content, "status": status})
-        # 互斥规则：校验 in_progress_count。业务逻辑规定同一时间只能有一个任务处于“进行中”状态，如果超过 1 个，直接抛出异常。
-        if in_progress_count > 1:
-            raise ValueError("Only one todo can be in_progress at a time")
-
-        # 原子更新：只有当所有校验都通过后，才会将临时列表 validated 赋值给实例变量 self.items。这保证了内部状态永远不会处于“半损坏”的状态。
-        self.items = validated
-        # 返回结果：调用 render() 方法生成可视化字符串并返回。
-        return self.render()
-
-    def render(self) -> str:
-        # 空状态处理：如果 self.items 为空，直接返回 "No todos."。
-        if not self.items:
-            return "No todos."
-        # 生成标记符号：遍历所有待办事项，利用字典映射，将状态转换为直观的符号：
-        lines = []
-        for todo in self.items:
-            # [ ] 代表待办
-            # [>] 代表进行中
-            # [x] 代表已完成
-            marker = {
-                "pending": "[ ]",
-                "in_progress": "[>]",
-                "completed": "[x]",
-            }[todo["status"]]
-            lines.append(f"{marker} {todo['content']}")
-        # 统计进度：使用生成器表达式 sum(...) 快速计算状态为 "completed" 的任务总数 done。
-        done = sum(todo["status"] == "completed" for todo in self.items)
-
-        # 格式化输出：将每一行任务和最后的进度统计（例如 (2/5 completed)）用换行符 \n 拼接成一个完整的字符串返回。
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
-
-# 为什么不直接让模型输出计划而是需要这个工具？
-# 模型负责推理，状态交给系统来管。这个工具本质上是在模型和系统之间架了一座桥——模型用自然语言"想"计划，系统用代码"存"计划，再通过工具返回值把计划"喂"回给模型，形成一个稳定的闭环。
-TODO = TodoManager()
-
-
-# 定义一个生成待办事项的工具
-def run_todo_write(todos: list | str) -> str:
-    """
-    生成代办事项，根据大模型给的结果生成规范的待办事项列表，todos是模型输出
-    :param todos:
-    :return:
-    """
-    try:
-        output = TODO.update(todos)
-    except ValueError as e:
-        return f"Error: {e}"
-    print(f"\n\033[33m## Current Tasks\033[0m\n{output}")
-    return output
 
 # -- s02 : 工具定义和映射关系 --
-TOOLS: list[ChatCompletionToolParam] = [
+BASE_TOOLS: list[ChatCompletionToolParam] = [
     {
         "type": "function",
         "function": {
