@@ -248,36 +248,13 @@ BASE_TOOLS: list[ChatCompletionToolParam] = [
                  "required": ["pattern"]
             },
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "todo_write",
-            "description": "为当前coding会话创建并管理一个任务列表",
-            "parameters": {
-                "type": "object",
-                "properties": {"todos": {
-                    "type": "array",
-                    "maxItems": 20,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "content": {"type": "string","minLength": 1,"description": "待办事项的具体内容"},
-                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"],"description": "事项状态：pending=待办，in_progress=进行中，completed=已完成"},
-                        },
-                        "required": ["content", "status"]
-                    }
-                }},
-                "required": ["todos"]
-            },
-        }
     }
 ]
 
 
-TOOL_HANDLERS = {
+BASE_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,"todo_write": run_todo_write,
+    "edit_file": run_edit, "glob": run_glob
 }
 
 # -- s04: 钩子系统 (s03 审批逻辑使用钩子) --
@@ -398,7 +375,100 @@ register_hook("PreToolUse", permission_hook)            # 注册到“工具调�
 register_hook("PostToolUse", large_output_hook)         # 注册到“工具调用后”事件（检查大输出）
 register_hook("Stop", summary_hook)                     # 注册到“会话停止”事件（打印总结）
 
+def execute_tool(call, handlers: dict) -> str:
+    name=call.function.name
+    args = json.loads(call.function.arguments)
+    blocked = trigger_hooks("PreToolUse", call)
+    if blocked:
+        return str(blocked)
 
+    handler = handlers.get(name)
+    try:
+        output = handler(**args) if handler else f"Unknown: {block.name}"
+    except Exception as e:
+        output = f"Error: {e}"
+
+    trigger_hooks("PostToolUse", call, output)
+    return str(output)
+
+# -- s06 版本新特性：一个带有全新消息机制的嵌套智能体循环 --
+SUB_TOOLS = BASE_TOOLS
+SUB_HANDLERS = BASE_HANDLERS
+
+
+def extract_text(content) -> str:
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in content
+        if getattr(block, "type", None) == "text"
+    )
+
+
+def run_subagent(prompt: str) -> str:
+    print("\n\033[35m[Subagent started]\033[0m")
+    messages = [{"role": "user", "content": prompt}]
+
+    for _ in range(30):
+        response = client.chat.completions.create(
+            messages= [{"role": "system", "content": SUB_SYSTEM}]+messages,# type: ignore
+            model=MODEL,
+            tools=SUB_TOOLS,
+            max_tokens=8000,
+            extra_body={
+                "reasoning_effort": "high",
+                "thinking": {"type": "disabled"}
+            }
+        )
+        # 模型返回
+        assistant_message = response.choices[0].message
+        # 将本轮会话的 ai 输出加入对话上下文中（直接追加 SDK 返回的 ChatCompletionMessage 对象）
+        messages.append(assistant_message)
+
+        # 检查tool_calls(列表),如果没有工具调用，则循环结束返回
+        tool_calls = assistant_message.tool_calls or []
+        if not tool_calls:
+            # 当没有工具的时候说明这轮会话结束，循环停止，触发停止后的钩子
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({"role": "user", "content": force})
+                continue
+            print("\033[35m[Subagent done]\033[0m")
+            return extract_text(response.content) or "(no summary)"
+
+        for call in tool_calls:
+            output = execute_tool(call, SUB_HANDLERS)
+            print(f"  \033[90m[sub] {call.function.name}: {output[:100]}\033[0m")
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": output})
+
+    print("\033[35m[Subagent stopped]\033[0m")
+    return "Subagent stopped after 30 turns without a final answer."
+
+
+TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": "使用全新的对话上下文运行一个子智能体，并返回其最终文本结果。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "发给子智能体的任务提示词"
+                }
+            },
+            "required": ["prompt"],
+            "additionalProperties": False
+        }
+    }
+}
+
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 
 # 模型客户端获取
 client = OpenAI(
@@ -407,13 +477,7 @@ client = OpenAI(
 
 MODEL="deepseek-v4-flash"
 
-# s05 change: 系统级提示词增加规划引导
-# SYSTEM = (
-#     f"你是一个编码智能体，你的工作路径在{os.getcwd()}. "
-#     "如果你需要开展的是多步骤任务, 使用 todo_write 来规划你的每一步. "
-#     "当你执行时及时更新状态."
-#     "使用windows的CMD来完成这个任务，执行而不只是描述,所有回复用中文回答."
-# )
+
 
 SYSTEM = (
 f"你是位于 {WORKDIR} 的编码智能体。 "
@@ -424,7 +488,7 @@ f"你是位于 {WORKDIR} 的编码智能体。 "
 "完成给定的任务，然后返回一个简洁的最终答案。"
 )
 
-# -- Agent 主循环：s05 带提醒计数器的 Agent 循环 --
+# -- Agent 主循环：s05 父智能体 -- --
 def agent_loop(messages: list):
     # 计数todo
     rounds_since_todo = 0
@@ -454,40 +518,10 @@ def agent_loop(messages: list):
                 messages.append({"role": "user", "content": force})
                 continue
             return
-        # 默认todo是False，当调用后转为True
-        used_todo = False
+
         # 存在工具调用，则依次执行工具获取结果
         for call in tool_calls:
-            try:
-                print(f"\033[33m$ {call.function.name}\033[0m")
-                # s04 修改: 用钩子替代硬编码的 check_permission()
-
-                check_call = trigger_hooks("PreToolUse", call)
-
-
-                if check_call:
-                    messages.append({"role": "tool","tool_call_id": call.id,
-                                    "content": str(check_call)})
-                    continue
-                handler=TOOL_HANDLERS.get(call.function.name)
-                # 拿到参数字典
-                args = json.loads(call.function.arguments)
-                # 执行之前进行判别
-
-                output = handler(**args) if handler else f"Unknown: {call.function.name}"
-
-                # s04新增：工具调用后的钩子，只有在输出文本超限时触发
-                trigger_hooks("PostToolUse", call, output)  # s04: post hook
-
-
-            except Exception as exc:
-                # 将工具错误反馈给模型，让模型有机会调整
-                output = f"工具执行失败: {type(exc).__name__}: {exc}"
-
-            # 如果一但本轮调用了todo_write则used_todo为True
-            if call.function.name == "todo_write":
-                used_todo = True
-
+            output = execute_tool(call, TOOL_HANDLERS)
             # 每次把tool的返回添加到message中
             messages.append({
                 "role": "tool",
@@ -495,22 +529,11 @@ def agent_loop(messages: list):
                 "content": output,
             })
 
-        # 只要调用过todo_write则不提醒，3次未调用则提醒
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-        if rounds_since_todo >= 3:
-            # openai没有<reminder>这样的标签，因此删掉。
-            messages.append({
-                "role": "user",
-                "content": "提醒：请更新你的 todos 列表.",
-            })
-            # 重置为0
-            rounds_since_todo = 0
-
 
 
 
 if __name__ == "__main__":
-    print("s05: TodoWrite - plan before execution")
+    print("s06: Subagent - fresh messages, final text returns")
     print("输入问题，回车键发送，输入 q 退出.\n")
 
     history = []
